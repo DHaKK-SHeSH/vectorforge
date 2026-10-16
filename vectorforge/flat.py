@@ -21,11 +21,11 @@ class FlatIndex:
 
     def add(self, xb: np.ndarray) -> None:
         """Store the base vectors.
-
-        Hint: for 'l2' you can precompute ||x||^2 for every base vector here,
-        so search() does not redo it for every query batch.
         """
-        raise NotImplementedError("TODO: store xb (and precompute what search needs)")
+        self.xb = np.asarray(xb,dtype=np.float32)
+        self.xb_norms = (self.xb**2).sum(axis=1)
+        
+        
 
     def search(self, xq: np.ndarray, k: int):
         """Return (distances, ids), both of shape (nq, k), nearest first.
@@ -39,4 +39,19 @@ class FlatIndex:
         - floating-point error can make tiny squared distances slightly negative;
           think about whether to clip them
         """
-        raise NotImplementedError("TODO: exact search")
+        xq = np.asarray(xq,dtype=np.float32)
+        if self.metric == "ip":
+            D = xq @ self.xb.T
+        else:
+            q_norms = (xq**2).sum(axis=1)
+            D = q_norms[:, None] - 2 * (xq @ self.xb.T) + self.xb_norms
+            D = np.maximum(D, 0)  
+        
+        if self.metric == "ip":
+            ids = np.argsort(-D)
+        else:
+            ids = np.argsort(D)
+            
+        ids = ids[:,:k]
+        distances = np.take_along_axis(D,ids,axis=1)
+        return distances,ids
