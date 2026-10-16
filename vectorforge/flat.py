@@ -48,10 +48,13 @@ class FlatIndex:
             D = np.maximum(D, 0)  
         
         if self.metric == "ip":
-            ids = np.argsort(-D)
+            D_sorted = -D
         else:
-            ids = np.argsort(D)
-            
-        ids = ids[:,:k]
-        distances = np.take_along_axis(D,ids,axis=1)
+            D_sorted = D
+
+        part = np.argpartition(D_sorted, k-1, axis=1)[:,:k]
+        dist = np.take_along_axis(D, part, axis=1)
+        order = np.argsort(np.take_along_axis(D_sorted, part, axis=1), axis=1)
+        ids = np.take_along_axis(part, order, axis=1)                 # ids sorted by distance
+        distances = np.take_along_axis(dist, order, axis=1)
         return distances,ids
