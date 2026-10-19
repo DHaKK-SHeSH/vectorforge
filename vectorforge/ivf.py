@@ -16,7 +16,7 @@ Goal: make tests/test_ivf.py pass. Squared L2 distance only (like flat.py's 'l2'
 """
 
 import numpy as np
-
+from .flat import FlatIndex
 from .kmeans import assign, kmeans
 
 
@@ -40,7 +40,7 @@ class IVFIndex:
         Use a separate training set when you have one (SIFT ships siftsmall_learn),
         so the cells don't depend on what you later add.
         """
-        raise NotImplementedError("TODO: run your kmeans and keep the centroids")
+        self.centroids, _,_ = kmeans(xt,self.nlist,n_iter = self.n_iter,seed = self.seed)
 
     def add(self, xb: np.ndarray) -> None:
         """Store xb and build the inverted lists.
@@ -52,7 +52,11 @@ class IVFIndex:
           the ids by cell, and np.bincount gives where each group starts.)
         - Raise an error if add() is called before train().
         """
-        raise NotImplementedError("TODO: build the inverted lists")
+        if not self.is_trained:
+          raise RuntimeError("call train() first")
+        self.xb = np.asarray(xb, dtype=np.float32)
+        labels, _ = assign(self.xb,self.centroids)
+        self.lists = [np.flatnonzero(labels == j) for j in range(self.nlist)]
 
     def search(self, xq: np.ndarray, k: int):
         """Return (distances, ids), both (nq, k), squared L2, nearest first.
@@ -71,4 +75,23 @@ class IVFIndex:
         Step 1 can be done for all queries at once: it's a FlatIndex search
         over the centroids.
         """
-        raise NotImplementedError("TODO: search only the nprobe nearest cells")
+        xq = np.asarray(xq, dtype=np.float32)
+        finder = FlatIndex("l2")
+        finder.add(self.centroids)
+        _, cells = finder.search(xq, min(self.nprobe,self.nlist))
+        nq = len(xq)
+        D = np.full((nq,k),np.inf, dtype = np.float32)
+        I = np.full((nq,k),-1,dtype=np.int64)
+        
+        for qi in range(nq):
+          cand = np.concatenate([self.lists[c] for c in cells[qi]])
+          if len(cand) == 0:
+            continue
+          
+          d = ((self.xb[cand] - xq[qi]) ** 2).sum(axis=1)
+          kk = min(k,len(cand))
+          part = np.argpartition(d,kk-1)[:kk]
+          order = part[np.argsort(d[part])]                           # same positions, sorted closest first
+          D[qi, :kk] = d[order]
+          I[qi, :kk] = cand[order]
+        return D, I
