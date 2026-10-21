@@ -118,4 +118,26 @@ class PQIndex:
              (for every stored vector, look up the entry for its code in piece j)
           4. top-k per row, like flat.py (argpartition + argsort + take_along_axis)
         """
-        raise NotImplementedError("TODO: asymmetric distance search with lookup tables")
+        xq = np.asarray(xq,dtype=np.float32)
+        q_pieces = self._split(xq)
+        D = np.zeros((len(xq),len(self.codes)), dtype = np.float32)
+        
+        for j in range(self.m):
+            qj = q_pieces[:, j, :]
+            cat = self.codebooks[j]
+            
+            q_norms = (qj**2).sum(axis=1)
+            cat_norms = (cat**2).sum(axis=1)
+            table = q_norms[:,None] - 2 * (qj @ cat.T) + cat_norms
+            
+            D+= table[:,self.codes[:,j]]
+            
+        part = np.argpartition(D, k-1, axis=1)[:,:k]
+        dist = np.take_along_axis(D, part, axis=1)
+        order = np.argsort(np.take_along_axis(D, part, axis=1), axis=1)
+        ids = np.take_along_axis(part, order, axis=1)                
+        distances = np.take_along_axis(dist, order, axis=1)
+        return distances,ids
+
+            
+            
