@@ -1,0 +1,10 @@
+index,m,bytes_per_vector,recall_at_10,qps,train_s
+flat,-,512,1.0000,7656.6,0.00
+vectorforge_pq,4,4,0.3960,5023.3,13.59
+vectorforge_pq,8,8,0.5580,2961.6,17.95
+vectorforge_pq,16,16,0.7190,1599.8,27.02
+vectorforge_pq,32,32,0.8330,751.6,47.28
+faiss_pq,4,4,0.4080,22840.4,1.55
+faiss_pq,8,8,0.5860,14242.6,2.71
+faiss_pq,16,16,0.7210,5954.4,5.84
+faiss_pq,32,32,0.8410,3934.1,25.47
