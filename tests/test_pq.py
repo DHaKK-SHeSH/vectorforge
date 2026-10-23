@@ -118,3 +118,14 @@ def test_sift_recall_and_compression():
     _, ids = pq.search(xq, 10)
     assert pq.codes.nbytes * 64 == xb.nbytes         # 64x smaller than the float32 vectors
     assert recall_at_k(ids, gt, 10) >= 0.35            # approximate, but far better than chance
+
+
+def test_distances_helper_matches_search(trained, data):
+    """distances(xq, codes) is the table-lookup part of search, for ANY codes you pass in."""
+    _, _, xq = data
+    D = trained.distances(xq, trained.codes)
+    assert D.shape == (20, 800)
+    d, ids = trained.search(xq, 10)
+    np.testing.assert_allclose(np.take_along_axis(D, ids, axis=1), d, rtol=1e-5, atol=1e-4)
+    part = trained.distances(xq, trained.codes[:50])      # a subset of the codes works too
+    np.testing.assert_allclose(part, D[:, :50], rtol=1e-5, atol=1e-4)

@@ -105,39 +105,34 @@ class PQIndex:
     def add(self, xb: np.ndarray) -> None:
         """Encode the database and keep ONLY the codes (that's the memory saving)."""
         self.codes = self.encode(xb)
-
-    def search(self, xq: np.ndarray, k: int):
-        """Return (distances, ids), both (nq, k), approximate squared L2, nearest first.
-
-        For all queries at once:
-          1. query pieces: self._split(xq) -> (nq, m, dsub)
-          2. tables T with shape (nq, m, ksub):
-             T[q, j, c] = squared distance from query q's piece j to centroid c of codebook j
-             (one small distance matrix per j, the same formula as assign / flat.py)
-          3. D = zeros (nq, n); for each j: D += T[:, j, :][:, self.codes[:, j]]
-             (for every stored vector, look up the entry for its code in piece j)
-          4. top-k per row, like flat.py (argpartition + argsort + take_along_axis)
-        """
-        xq = np.asarray(xq,dtype=np.float32)
-        q_pieces = self._split(xq)
-        D = np.zeros((len(xq),len(self.codes)), dtype = np.float32)
         
+    def distances(self, xq: np.ndarray, codes: np.ndarray) -> np.ndarray:
+        """Distance from every query to every code in `codes`. Returns (nq, len(codes))."""
+        xq = np.asarray(xq, dtype=np.float32)
+        q_pieces = self._split(xq)
+        D = np.zeros((len(xq), len(codes)), dtype=np.float32)
+
         for j in range(self.m):
             qj = q_pieces[:, j, :]
             cat = self.codebooks[j]
-            
+
             q_norms = (qj**2).sum(axis=1)
             cat_norms = (cat**2).sum(axis=1)
-            table = q_norms[:,None] - 2 * (qj @ cat.T) + cat_norms
-            
-            D+= table[:,self.codes[:,j]]
-            
-        part = np.argpartition(D, k-1, axis=1)[:,:k]
-        dist = np.take_along_axis(D, part, axis=1)
-        order = np.argsort(np.take_along_axis(D, part, axis=1), axis=1)
-        ids = np.take_along_axis(part, order, axis=1)                
-        distances = np.take_along_axis(dist, order, axis=1)
-        return distances,ids
+            table = q_norms[:, None] - 2 * (qj @ cat.T) + cat_norms
 
+            D += table[:, codes[:, j]]
+
+        return np.maximum(D, 0)
+
+    def search(self, xq: np.ndarray, k: int):
+        """Return (distances, ids), both (nq, k), approximate squared L2, nearest first."""
+        D = self.distances(xq, self.codes)
+
+        part = np.argpartition(D, k-1, axis=1)[:, :k]
+        dist = np.take_along_axis(D, part, axis=1)
+        order = np.argsort(dist, axis=1)
+        ids = np.take_along_axis(part, order, axis=1)
+        distances = np.take_along_axis(dist, order, axis=1)
+        return distances, ids
             
             
