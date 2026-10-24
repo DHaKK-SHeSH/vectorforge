@@ -2,7 +2,7 @@
 
 Approximate nearest-neighbour search written from scratch in NumPy — exact search, IVF, product quantisation and HNSW — benchmarked against Faiss on recall, speed and memory.
 
-> 🚧 In progress: exact search, IVF and product quantisation are done. IVF-PQ and HNSW are next.
+> 🚧 In progress: exact search, IVF, product quantisation and IVF-PQ are done. HNSW is next.
 
 ## Results
 
@@ -17,7 +17,8 @@ SIFT10K (10,000 base vectors, 100 queries, 128 dimensions), k = 10, measured on 
 | PQ (VectorForge) | m=8, 8 bits (8 bytes/vector) | 0.558 | 2,962 | 0.08 + 0.13 codebooks |
 | PQ (VectorForge) | m=32, 8 bits (32 bytes/vector) | 0.833 | 752 | 0.32 + 0.13 codebooks |
 | PQ (Faiss) | m=8, 8 bits | 0.586 | 14,243 | 0.08 + 0.13 codebooks |
-| IVF-PQ | — | — | — | — |
+| IVF-PQ (VectorForge) | nlist=100, nprobe=8, m=8 (8-byte codes) | 0.607 | 700 | ≈0.34 (codes 0.08, ids 0.08, codebooks + centroids 0.18) |
+| IVF-PQ (Faiss) | nlist=100, nprobe=8, m=8 | 0.588 | 44,098 | — |
 | HNSW | — | — | — | — |
 
 ## IVF: speed vs recall
@@ -56,6 +57,32 @@ Full numbers: [`docs/pq_sweep.csv`](docs/pq_sweep.csv).
 - **On this dataset my PQ is slower than exact search, and halves in speed every time m doubles.** It's not the arithmetic: per stored vector PQ does m lookups instead of 128 multiply-adds, and the distance tables are tiny (100 queries × 256 entries per piece). The cost is that every piece's lookup (`table[:, codes[:, j]]`) builds a new 100 × 10,000 array, so the search time is m full passes over memory (5,023 → 2,962 → 1,600 → 752 QPS). Exact search is a single optimised matrix multiply.
 - **Faiss gets the same recall (within 0.03) but searches 3.7–5.2× faster and trains 2–9× faster.** Same algorithm; the small recall differences come from k-means initialisation and training settings. Faiss's compiled C++ loop walks over the codes once and adds up the m table values for each vector. The tables (m × 256 floats) stay in the CPU cache, and no large temporary arrays are created.
 
+## IVF-PQ: cells + compressed codes
+
+IVF-PQ combines the two: IVF's cells decide where to look, and inside each cell vectors are stored as 8-byte PQ codes. With residuals (the default, as in Faiss), PQ encodes each vector's offset from its cell centre instead of the vector itself, and a query is compared as its offset from the same centre.
+
+![Recall vs queries per second for VectorForge IVF-PQ with and without residuals, Faiss IndexIVFPQ, plain PQ and exact search](docs/ivfpq_sweep.png)
+
+nlist = 100, m = 8 (8 bytes per vector), SIFT10K, k = 10:
+
+| nprobe | residuals: recall@10 | QPS | no residuals: recall@10 | QPS | Faiss: recall@10 | Faiss QPS |
+|---|---|---|---|---|---|---|
+| 1 | 0.420 | 5,043 | 0.388 | 5,045 | 0.403 | 71,690 |
+| 2 | 0.540 | 2,659 | 0.494 | 2,671 | 0.495 | 66,348 |
+| 4 | 0.591 | 1,371 | 0.543 | 1,382 | 0.570 | 56,287 |
+| 8 | 0.607 | 700 | 0.559 | 712 | 0.588 | 44,098 |
+| 16 | 0.607 | 352 | 0.558 | 362 | 0.595 | 30,045 |
+| 100 | 0.607 | 56 | 0.558 | 54 | 0.596 | 6,915 |
+
+Reference points in the same run: plain PQ (m = 8, no cells) 0.558 at 2,902 QPS; Flat 1.000 at 6,288 QPS. Training took 24 s for mine and 3 s for Faiss. Full numbers: [`docs/ivfpq_sweep.csv`](docs/ivfpq_sweep.csv).
+
+**Findings**
+
+- **Residuals add recall at no extra memory.** With the same 8 bytes per vector, encoding offsets gives 0.607 instead of 0.559 at nprobe = 8. Without residuals, probing every cell gives exactly plain PQ's recall (0.558): the cells only decide where to look. With residuals the catalogues learn offsets from the cell centres, which are small and look alike in every cell, so 256 entries per piece describe them much more finely than they can describe raw vectors spread over the whole space.
+- **Recall plateaus at 0.607 from nprobe = 8, well below IVF's 1.0.** IVF stores full vectors, so once enough cells are probed its distances are exact. IVF-PQ only has approximations (cell centre + decoded offset), so even with all 100 cells probed some true neighbours are ranked below vectors whose reconstructions happen to sit closer to the query. Probing more cells adds candidates but can't fix the ranking. Going higher needs more bytes per vector (larger m) or a re-ranking step with exact distances on a short candidate list.
+- **My IVF-PQ is slower than plain PQ from nprobe = 2 on, even though it scores only about nprobe % of the codes.** The search loops over queries and, inside, over the probed cells: at nprobe = 8 that is 800 calls to the PQ distance function for 100 queries, and each call rebuilds m distance tables because the query's offset is different for every cell. The fixed interpreter and NumPy overhead per call outweighs the arithmetic saved, so QPS halves every time nprobe doubles. Only at nprobe = 1 does it beat plain PQ (5,043 vs 2,902 QPS).
+- **Faiss gets similar recall but is 14–123× faster to search and about 8× faster to train.** Same algorithm; my recall is slightly higher from nprobe = 2 on, as with IVF, most likely because my k-means starts from k-means++ and Faiss from random centroids. Faiss runs the loop over each cell's codes in compiled C++, with no per-call interpreter overhead, no large temporary arrays and the small tables kept in the CPU cache. This is where my implementation's Python loops cost the most.
+
 ## Run it
 
 ```bash
@@ -65,6 +92,7 @@ python -m vectorforge.bench     # exact-search benchmark on SIFT10K (see data/RE
 pip install faiss-cpu
 python scripts/sweep_ivf.py     # IVF nprobe sweep vs Faiss → docs/ivf_sweep.csv and .png
 python scripts/sweep_pq.py      # PQ sweep over m vs Faiss → docs/pq_sweep.csv and .png
+python scripts/sweep_ivfpq.py   # IVF-PQ nprobe sweep, with/without residuals, vs Faiss → docs/ivfpq_sweep.csv and .png
 ```
 
 ## Layout
@@ -75,6 +103,8 @@ python scripts/sweep_pq.py      # PQ sweep over m vs Faiss → docs/pq_sweep.csv
 - `vectorforge/kmeans.py` — k-means with k-means++ initialisation
 - `vectorforge/ivf.py` — IVF index: k-means cells, inverted lists, nprobe search
 - `vectorforge/pq.py` — product quantisation: per-piece codebooks, 1-byte codes, lookup-table (ADC) search
+- `vectorforge/ivfpq.py` — IVF-PQ: IVF cells holding PQ codes of residuals, per-cell table lookups
 - `vectorforge/bench.py` — one harness that measures every index the same way
 - `scripts/sweep_ivf.py` — IVF recall/speed sweep against Faiss
 - `scripts/sweep_pq.py` — PQ recall/memory/speed sweep against Faiss
+- `scripts/sweep_ivfpq.py` — IVF-PQ nprobe sweep with and without residuals against Faiss
