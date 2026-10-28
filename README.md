@@ -2,7 +2,7 @@
 
 Approximate nearest-neighbour search written from scratch in NumPy — exact search, IVF, product quantisation and HNSW — benchmarked against Faiss on recall, speed and memory.
 
-> 🚧 In progress: exact search, IVF, product quantisation and IVF-PQ are done. HNSW is next.
+> 🚧 In progress: all five indexes are done (exact search, IVF, PQ, IVF-PQ and HNSW). Next: the SIFT1M benchmark and a small search service.
 
 ## Results
 
@@ -19,7 +19,8 @@ SIFT10K (10,000 base vectors, 100 queries, 128 dimensions), k = 10, measured on 
 | PQ (Faiss) | m=8, 8 bits | 0.586 | 14,243 | 0.08 + 0.13 codebooks |
 | IVF-PQ (VectorForge) | nlist=100, nprobe=8, m=8 (8-byte codes) | 0.607 | 700 | ≈0.34 (codes 0.08, ids 0.08, codebooks + centroids 0.18) |
 | IVF-PQ (Faiss) | nlist=100, nprobe=8, m=8 | 0.588 | 44,098 | — |
-| HNSW | — | — | — | — |
+| HNSW (VectorForge) | M=16, ef_construction=100, ef_search=64 | 0.992 | 859 | ≈7.8 (vectors 5.12 + ≈33 links/vector at 8 bytes) |
+| HNSW (Faiss) | M=16, efConstruction=100, efSearch=64 | 0.996 | 22,078 | — |
 
 ## IVF: speed vs recall
 
@@ -83,6 +84,30 @@ Reference points in the same run: plain PQ (m = 8, no cells) 0.558 at 2,902 QPS;
 - **My IVF-PQ is slower than plain PQ from nprobe = 2 on, even though it scores only about nprobe % of the codes.** The search loops over queries and, inside, over the probed cells: at nprobe = 8 that is 800 calls to the PQ distance function for 100 queries, and each call rebuilds m distance tables because the query's offset is different for every cell. The fixed interpreter and NumPy overhead per call outweighs the arithmetic saved, so QPS halves every time nprobe doubles. Only at nprobe = 1 does it beat plain PQ (5,043 vs 2,902 QPS).
 - **Faiss gets similar recall but is 14–123× faster to search and about 8× faster to train.** Same algorithm; my recall is slightly higher from nprobe = 2 on, as with IVF, most likely because my k-means starts from k-means++ and Faiss from random centroids. Faiss runs the loop over each cell's codes in compiled C++, with no per-call interpreter overhead, no large temporary arrays and the small tables kept in the CPU cache. This is where my implementation's Python loops cost the most.
 
+## HNSW: graph search
+
+HNSW links every vector to its nearest neighbours and stacks sparser copies of that graph on top, like zoom levels on a map. A search starts at the top layer, walks greedily towards the query, drops a layer, and finishes with a best-first search on layer 0 that keeps a shortlist of `ef_search` candidates. Vectors are stored in full, so distances are exact; the only approximation is which vectors the walk reaches.
+
+![Recall vs queries per second for VectorForge HNSW and Faiss HNSW at M = 8 and 16](docs/hnsw_sweep.png)
+
+ef_construction = 100, SIFT10K, k = 10:
+
+| ef_search | mine, M=8: recall@10 | QPS | mine, M=16: recall@10 | QPS | Faiss, M=8: recall@10 | Faiss, M=16: recall@10 | Faiss M=16 QPS |
+|---|---|---|---|---|---|---|---|
+| 10 | 0.746 | 2,657 | 0.922 | 2,749 | 0.882 | 0.907 | 95,220 |
+| 32 | 0.861 | 1,456 | 0.980 | 1,352 | 0.976 | 0.986 | 41,293 |
+| 64 | 0.903 | 956 | 0.992 | 859 | 0.996 | 0.996 | 22,078 |
+| 256 | 0.931 | 322 | 0.997 | 284 | 0.999 | 1.000 | 4,882 |
+
+Build time: 17.8 s (M = 8) and 23.8 s (M = 16) for mine, 0.6–0.7 s for Faiss. Links per vector: 17.1 (M = 8) and 33.1 (M = 16). Flat in the same run: 1.000 at 7,315 QPS. Full numbers: [`docs/hnsw_sweep.csv`](docs/hnsw_sweep.csv).
+
+**Findings**
+
+- **ef_search trades speed for recall, with diminishing returns.** It is the size of the shortlist on layer 0: a bigger shortlist explores more nodes before it stops, so it misses fewer neighbours but measures more distances. At M = 16, going from 10 to 64 lifts recall from 0.922 to 0.992 for about 3× less speed; going on to 256 adds only 0.005 for another 3×.
+- **More links (M = 16) give much better recall, paid for in memory and build time.** With more neighbours per node there are more routes to the target and fewer dead ends: 0.922 vs 0.746 at ef_search = 10, and M = 8 never gets past 0.931. It costs 33 instead of 17 links per vector (about 2.6 MB of graph on top of the 5.1 MB of vectors, counting 8 bytes per link) and 34% longer builds. Search speed at the same ef_search is about the same.
+- **On 10,000 vectors my HNSW is about 8× slower than exact search at recall 0.99.** It does far less arithmetic, but in many tiny steps: each query pops nodes one at a time from a heap, measures a handful of neighbours per step in a small NumPy call, and the 100 queries run one after another. Flat does all 100 × 10,000 distances in one optimised matrix multiply. Flat's cost grows with the number of vectors while HNSW's grows roughly with its logarithm, so this should flip on SIFT1M. Faiss's compiled HNSW is already 3× faster than my Flat here.
+- **Faiss is 15–35× faster to search and about 30× faster to build, and at M = 8 it also gets much better recall (0.882 vs 0.746 at ef_search = 10).** The speed comes from compiled loops. The recall gap comes from how neighbours are chosen: my insert links each vector to its M closest candidates, which can all sit on the same side of it. Faiss uses the paper's selection heuristic, which skips a candidate that is closer to an already-chosen neighbour than to the new vector, so the links point in different directions and the graph stays navigable. With few links (M = 8) that matters a lot; at M = 16 there are enough links that the two are close (0.922 vs 0.907).
+
 ## Run it
 
 ```bash
@@ -93,6 +118,7 @@ pip install faiss-cpu
 python scripts/sweep_ivf.py     # IVF nprobe sweep vs Faiss → docs/ivf_sweep.csv and .png
 python scripts/sweep_pq.py      # PQ sweep over m vs Faiss → docs/pq_sweep.csv and .png
 python scripts/sweep_ivfpq.py   # IVF-PQ nprobe sweep, with/without residuals, vs Faiss → docs/ivfpq_sweep.csv and .png
+python scripts/sweep_hnsw.py    # HNSW ef_search sweep at M = 8 and 16 vs Faiss → docs/hnsw_sweep.csv and .png
 ```
 
 ## Layout
@@ -104,7 +130,9 @@ python scripts/sweep_ivfpq.py   # IVF-PQ nprobe sweep, with/without residuals, v
 - `vectorforge/ivf.py` — IVF index: k-means cells, inverted lists, nprobe search
 - `vectorforge/pq.py` — product quantisation: per-piece codebooks, 1-byte codes, lookup-table (ADC) search
 - `vectorforge/ivfpq.py` — IVF-PQ: IVF cells holding PQ codes of residuals, per-cell table lookups
+- `vectorforge/hnsw.py` — HNSW: layered neighbour graph, best-first search with two heaps, insert with pruning
 - `vectorforge/bench.py` — one harness that measures every index the same way
 - `scripts/sweep_ivf.py` — IVF recall/speed sweep against Faiss
 - `scripts/sweep_pq.py` — PQ recall/memory/speed sweep against Faiss
 - `scripts/sweep_ivfpq.py` — IVF-PQ nprobe sweep with and without residuals against Faiss
+- `scripts/sweep_hnsw.py` — HNSW ef_search sweep at two graph sizes against Faiss
