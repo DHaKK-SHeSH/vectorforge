@@ -69,16 +69,20 @@ def assign(x: np.ndarray, centroids: np.ndarray) -> Tuple[np.ndarray, np.ndarray
     Hint: this is your flat.py distance matrix again, with the centroids playing
     the role of the database. Then argmin along each row. No Python loop.
     """
-    x = np.asarray(x,dtype=np.float32)
-    centroids = np.asarray(centroids,dtype=np.float32)
-    
-    x_norms = (x**2).sum(axis=1)
-    centroids_norms = (centroids**2).sum(axis=1)
-    D = x_norms[:,None] - 2 * (x @ centroids.T) + centroids_norms
-    D = np.maximum(D,0)
-    labels = D.argmin(axis=1)
-    sq_dist = D.min(axis=1)
-    return labels,sq_dist
+    x = np.asarray(x, dtype=np.float32)
+    centroids = np.asarray(centroids, dtype=np.float32)
+    centroids_norms = (centroids**2).sum(axis=1)          # same for every batch: compute once
+    labels = np.empty(len(x), dtype=np.int64)             # answer sheets, filled batch by batch
+    sq_dist = np.empty(len(x), dtype=np.float32)
+
+    for start in range(0, len(x), 65536):                 # 0, 65536, 131072, ...
+        xs = x[start:start + 65536]                       # this batch of rows
+        D = (xs**2).sum(axis=1)[:, None] - 2 * (xs @ centroids.T) + centroids_norms
+        D = np.maximum(D, 0)
+        labels[start:start + 65536] = D.argmin(axis=1)
+        sq_dist[start:start + 65536] = D.min(axis=1)
+
+    return labels, sq_dist
 
 
 def update_centroids(x: np.ndarray, labels: np.ndarray, centroids: np.ndarray,
