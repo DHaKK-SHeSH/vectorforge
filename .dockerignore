@@ -1,0 +1,11 @@
+data/
+docs/
+notebooks/
+study/
+tests/
+scripts/
+*.vf.npz
+*.egg-info/
+__pycache__/
+.git/
+.venv/

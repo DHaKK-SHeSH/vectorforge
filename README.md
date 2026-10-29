@@ -2,7 +2,7 @@
 
 Approximate nearest-neighbour search written from scratch in NumPy — exact search, IVF, product quantisation and HNSW — benchmarked against Faiss on recall, speed and memory.
 
-> 🚧 In progress: all five indexes are done and benchmarked on SIFT10K and SIFT1M. Next: save/load and a small search service.
+> 🚧 Almost v1.0: all five indexes are done, benchmarked on SIFT10K and SIFT1M, and can be saved, loaded and served over HTTP. Next: final polish.
 
 **Headline (SIFT1M, 1 million vectors):** my IVF is 2× and my HNSW 3.3× faster than exact search at about 92% recall. Details in [SIFT1M: does it scale?](#sift1m-does-it-scale)
 
@@ -139,6 +139,38 @@ Settings: nlist = 1024, m = 8 (8 bytes per vector), HNSW M = 16 with ef_construc
     - fast queries at about 90%: **HNSW**, 1.6× faster than IVF at the same recall, but it needs 50% more memory than IVF and took 58 minutes to build instead of 1.6
 - \* **A note on fairness:** my exact search (80 queries/s) beat Faiss's (23) only because NumPy's matrix multiply automatically used every CPU core, while I limited Faiss to one. Everywhere else my code runs mostly on one core in Python loops, and Faiss is 6–18× faster at searching.
 
+## Save, load and serve
+
+Building an index takes a while (20 seconds for HNSW on SIFT10K, an hour on SIFT1M), so you only want to do it once. `vectorforge.persist` writes any of the five indexes to a single `.npz` file and reads it back, and a small FastAPI app serves searches from it over HTTP.
+
+```python
+from vectorforge.persist import save, load
+save(index, "index.vf.npz")
+index = load("index.vf.npz")      # same results, no rebuilding
+```
+
+- **One file, plain arrays.** Settings go in a small JSON string inside the file; everything else is NumPy arrays. Lists with different lengths (IVF's cells, HNSW's neighbour lists) are stored as one long array plus the positions where each piece starts.
+- **Loading is fast.** On SIFT10K the HNSW graph took 20 s to build and 0.02 s to load (8 MB on disk); IVF-PQ is 0.3 MB.
+- **Safe to open.** Files are read with `allow_pickle=False`, so loading a file from someone else can't run code.
+- **HNSW can keep growing after a reload:** the random-level generator is saved too, so adding vectors to a loaded graph gives exactly the same graph as adding them to the original. A test checks this.
+
+**The search service**
+
+```bash
+pip install -e ".[service]"
+python scripts/build_index.py --kind hnsw --out index.vf.npz     # build on SIFT10K, save, check the round trip
+VF_INDEX=index.vf.npz uvicorn vectorforge.service:app --port 8000
+# PowerShell: $env:VF_INDEX = "index.vf.npz"; uvicorn vectorforge.service:app --port 8000
+```
+
+| Endpoint | What it does |
+|---|---|
+| `GET /health` | what's loaded: index type, number of vectors, dimension, current settings |
+| `POST /search` | `{"vectors": [[...128 numbers...]], "k": 10, "ef_search": 64}` → `{"ids": [[...]], "distances": [[...]], "took_ms": 5.3}` |
+| `GET /docs` | an interactive page to try the API in the browser (made by FastAPI) |
+
+`nprobe` (IVF, IVF-PQ) and `ef_search` (HNSW) can be set per request without changing the index's defaults. Wrong dimensions or a setting that doesn't fit the index type return a clear 422 error. The service is read-only: it loads the index once at start-up and only searches. There's also a `Dockerfile` that runs the same service in a container, with the index file mounted from outside.
+
 ## Run it
 
 ```bash
@@ -151,6 +183,8 @@ python scripts/sweep_pq.py      # PQ sweep over m vs Faiss → docs/pq_sweep.csv
 python scripts/sweep_ivfpq.py   # IVF-PQ nprobe sweep, with/without residuals, vs Faiss → docs/ivfpq_sweep.csv and .png
 python scripts/sweep_hnsw.py    # HNSW ef_search sweep at M = 8 and 16 vs Faiss → docs/hnsw_sweep.csv and .png
 # SIFT1M: run notebooks/sift1m_benchmark.ipynb on Kaggle (CPU, internet on, about 1.5 hours)
+python scripts/build_index.py --kind hnsw --out index.vf.npz   # build + save an index
+uvicorn vectorforge.service:app                                # serve it (set VF_INDEX first, see above)
 ```
 
 ## Layout
@@ -163,9 +197,13 @@ python scripts/sweep_hnsw.py    # HNSW ef_search sweep at M = 8 and 16 vs Faiss 
 - `vectorforge/pq.py` — product quantisation: per-piece codebooks, 1-byte codes, lookup-table (ADC) search
 - `vectorforge/ivfpq.py` — IVF-PQ: IVF cells holding PQ codes of residuals, per-cell table lookups
 - `vectorforge/hnsw.py` — HNSW: layered neighbour graph, best-first search with two heaps, insert with pruning
+- `vectorforge/persist.py` — save / load any index to one `.npz` file (no pickle)
+- `vectorforge/service.py` — FastAPI search service (`/health`, `/search`)
 - `vectorforge/bench.py` — one harness that measures every index the same way
 - `scripts/sweep_ivf.py` — IVF recall/speed sweep against Faiss
 - `scripts/sweep_pq.py` — PQ recall/memory/speed sweep against Faiss
 - `scripts/sweep_ivfpq.py` — IVF-PQ nprobe sweep with and without residuals against Faiss
 - `scripts/sweep_hnsw.py` — HNSW ef_search sweep at two graph sizes against Faiss
 - `notebooks/sift1m_benchmark.ipynb` — every index vs Faiss on 1 million vectors (Kaggle)
+- `scripts/build_index.py` — build one index on SIFT10K, save it, check the reload
+- `Dockerfile` — the search service in a container
