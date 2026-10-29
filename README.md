@@ -2,7 +2,9 @@
 
 Approximate nearest-neighbour search written from scratch in NumPy — exact search, IVF, product quantisation and HNSW — benchmarked against Faiss on recall, speed and memory.
 
-> 🚧 In progress: all five indexes are done (exact search, IVF, PQ, IVF-PQ and HNSW). Next: the SIFT1M benchmark and a small search service.
+> 🚧 In progress: all five indexes are done and benchmarked on SIFT10K and SIFT1M. Next: save/load and a small search service.
+
+**Headline (SIFT1M, 1 million vectors):** my IVF is 2× and my HNSW 3.3× faster than exact search at about 92% recall. Details in [SIFT1M: does it scale?](#sift1m-does-it-scale)
 
 ## Results
 
@@ -108,6 +110,35 @@ Build time: 17.8 s (M = 8) and 23.8 s (M = 16) for mine, 0.6–0.7 s for Faiss. 
 - **On 10,000 vectors my HNSW is about 8× slower than exact search at recall 0.99.** It does far less arithmetic, but in many tiny steps: each query pops nodes one at a time from a heap, measures a handful of neighbours per step in a small NumPy call, and the 100 queries run one after another. Flat does all 100 × 10,000 distances in one optimised matrix multiply. Flat's cost grows with the number of vectors while HNSW's grows roughly with its logarithm, so this should flip on SIFT1M. Faiss's compiled HNSW is already 3× faster than my Flat here.
 - **Faiss is 15–35× faster to search and about 30× faster to build, and at M = 8 it also gets much better recall (0.882 vs 0.746 at ef_search = 10).** The speed comes from compiled loops. The recall gap comes from how neighbours are chosen: my insert links each vector to its M closest candidates, which can all sit on the same side of it. Faiss uses the paper's selection heuristic, which skips a candidate that is closer to an already-chosen neighbour than to the new vector, so the links point in different directions and the graph stays navigable. With few links (M = 8) that matters a lot; at M = 16 there are enough links that the two are close (0.922 vs 0.907).
 
+## SIFT1M: does it scale?
+
+On 10,000 vectors, exact search beat almost everything. So I ran every index again on **1,000,000** vectors (SIFT1M), 100× more, to see if that changes. Same code, run on a Kaggle CPU with 1,000 queries: [`notebooks/sift1m_benchmark.ipynb`](notebooks/sift1m_benchmark.ipynb).
+
+![Speed vs recall for every VectorForge index and its Faiss version on SIFT1M, and the memory each index needs](docs/sift1m.png)
+
+| Index | Setting | recall@10 | queries/s | memory (MB) | build time | Faiss: recall@10 | Faiss: queries/s |
+|---|---|---|---|---|---|---|---|
+| Flat (exact) | — | 0.999 ** | 80 | 512 | — | 0.999 | 23 * |
+| IVF | nprobe = 16 | 0.925 | 165 | 521 | 1.6 min | 0.916 | 1,134 |
+| IVF | nprobe = 64 | 0.994 | 32 | 521 | 1.6 min | 0.995 | 301 |
+| PQ | m = 8 | 0.314 | 10 | 8 | 2.0 min | 0.308 | 121 |
+| IVF-PQ | nprobe = 16 | 0.368 | 204 | 17 | 3.6 min | 0.370 | 3,246 |
+| HNSW | ef_search = 16 | 0.683 | 1,053 | 777 | 58 min | 0.749 | 11,728 |
+| HNSW | ef_search = 128 | 0.920 | 267 | 777 | 58 min | 0.972 | 2,472 |
+
+Settings: nlist = 1024, m = 8 (8 bytes per vector), HNSW M = 16 with ef_construction = 64. Faiss searches ran on one CPU core; Faiss builds used all cores. \*\* Exact search scores 0.999 rather than 1.000 because for a few queries the 10th and 11th neighbours are tied or differ only by rounding, so the order can flip. Full numbers: [`docs/sift1m_results.csv`](docs/sift1m_results.csv).
+
+**What I learned**
+
+- **At a million vectors, approximate search finally pays off, as long as about 90% is good enough.** Exact search has to check all 1,000,000 vectors for every query. IVF with nprobe = 16 only looks at about 16,000 of them and still finds 92.5% of the true neighbours, twice as fast. HNSW finds 92% while being 3.3× faster, and 13× faster if 68% is enough.
+- **If you need about 99% of the answers right, exact search still wins here.** To get IVF to 99.4%, it has to look in 64 cells, about 6% of everything, and my Python loop makes that slower than one big exact matrix multiply (32 vs 80 queries per second). The closer you want to get to perfect, the more an approximate index has to look at, until it might as well check everything. Faiss, with compiled loops, still wins at 99% (301 queries per second).
+- **8-byte codes lose a lot at this size.** PQ dropped from 56% recall on 10,000 vectors to 31% here, and IVF-PQ from 61% to 37%, with exactly the same 8 bytes per vector. With 100× more vectors in the same space, a query's true neighbours sit very close to each other, closer than the rounding error of an 8-byte code, so the codes can't tell which one is really nearest. Like describing houses only by their street: fine in a village, useless in a city. The fix is more bytes per vector, or re-checking a short list with exact distances.
+- **Every index is a trade-off between four things: recall, speed, memory and build time.** None wins at all four. From these numbers:
+    - need about 99% right: **exact search** (or Faiss IVF)
+    - very little memory (about 20 MB for a million vectors): **IVF-PQ**, 30× smaller than the vectors, but only with a re-ranking step to fix its recall
+    - fast queries at about 90%: **HNSW**, 1.6× faster than IVF at the same recall, but it needs 50% more memory than IVF and took 58 minutes to build instead of 1.6
+- \* **A note on fairness:** my exact search (80 queries/s) beat Faiss's (23) only because NumPy's matrix multiply automatically used every CPU core, while I limited Faiss to one. Everywhere else my code runs mostly on one core in Python loops, and Faiss is 6–18× faster at searching.
+
 ## Run it
 
 ```bash
@@ -119,6 +150,7 @@ python scripts/sweep_ivf.py     # IVF nprobe sweep vs Faiss → docs/ivf_sweep.c
 python scripts/sweep_pq.py      # PQ sweep over m vs Faiss → docs/pq_sweep.csv and .png
 python scripts/sweep_ivfpq.py   # IVF-PQ nprobe sweep, with/without residuals, vs Faiss → docs/ivfpq_sweep.csv and .png
 python scripts/sweep_hnsw.py    # HNSW ef_search sweep at M = 8 and 16 vs Faiss → docs/hnsw_sweep.csv and .png
+# SIFT1M: run notebooks/sift1m_benchmark.ipynb on Kaggle (CPU, internet on, about 1.5 hours)
 ```
 
 ## Layout
@@ -136,3 +168,4 @@ python scripts/sweep_hnsw.py    # HNSW ef_search sweep at M = 8 and 16 vs Faiss 
 - `scripts/sweep_pq.py` — PQ recall/memory/speed sweep against Faiss
 - `scripts/sweep_ivfpq.py` — IVF-PQ nprobe sweep with and without residuals against Faiss
 - `scripts/sweep_hnsw.py` — HNSW ef_search sweep at two graph sizes against Faiss
+- `notebooks/sift1m_benchmark.ipynb` — every index vs Faiss on 1 million vectors (Kaggle)
