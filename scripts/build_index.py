@@ -2,6 +2,7 @@
 
     python scripts/build_index.py --kind hnsw --out index.vf.npz
     python scripts/build_index.py --kind ivf --nlist 100 --nprobe 8 --out ivf.vf.npz
+    python scripts/build_index.py --kind ivfpq --refine 10 --out ivfpq-refine.vf.npz   # + exact re-ranking
 
 Then serve it:   VF_INDEX=index.vf.npz uvicorn vectorforge.service:app
 (PowerShell:     $env:VF_INDEX = "index.vf.npz"; uvicorn vectorforge.service:app)
@@ -19,6 +20,7 @@ from vectorforge.ivfpq import IVFPQIndex
 from vectorforge.metrics import recall_at_k
 from vectorforge.persist import describe, load, save
 from vectorforge.pq import PQIndex
+from vectorforge.refine import RefineIndex
 
 DATA = Path(__file__).resolve().parents[1] / "data" / "siftsmall"
 
@@ -33,6 +35,9 @@ def main():
     p.add_argument("--M", type=int, default=16, help="HNSW links per node")
     p.add_argument("--ef-construction", type=int, default=100)
     p.add_argument("--ef-search", type=int, default=64)
+    p.add_argument("--no-heuristic", action="store_true", help="HNSW: plain closest-M links (v1.0 behaviour)")
+    p.add_argument("--refine", type=int, default=0, metavar="K_FACTOR",
+                   help="wrap the index in exact re-ranking of k * K_FACTOR candidates (0 = off)")
     args = p.parse_args()
 
     xb, xq, gt = load_sift(DATA, "siftsmall")
@@ -43,8 +48,11 @@ def main():
         "ivf": lambda: IVFIndex(nlist=args.nlist, nprobe=args.nprobe),
         "pq": lambda: PQIndex(m=args.m),
         "ivfpq": lambda: IVFPQIndex(nlist=args.nlist, nprobe=args.nprobe, m=args.m),
-        "hnsw": lambda: HNSWIndex(M=args.M, ef_construction=args.ef_construction, ef_search=args.ef_search),
+        "hnsw": lambda: HNSWIndex(M=args.M, ef_construction=args.ef_construction, ef_search=args.ef_search,
+                                  heuristic=not args.no_heuristic),
     }[args.kind]()
+    if args.refine:
+        index = RefineIndex(index, k_factor=args.refine)
 
     t0 = time.perf_counter()
     if hasattr(index, "train"):

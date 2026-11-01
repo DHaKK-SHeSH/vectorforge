@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "vectorforge"
-version = "0.1.0"
+version = "1.1.0"
 description = "Approximate nearest-neighbour search from scratch: exact, IVF, product quantisation and HNSW, benchmarked against Faiss."
 readme = "README.md"
 requires-python = ">=3.11"

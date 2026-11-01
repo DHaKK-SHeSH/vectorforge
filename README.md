@@ -1,12 +1,37 @@
 # VectorForge
 
-Approximate nearest-neighbour search written from scratch in NumPy — exact search, IVF, product quantisation and HNSW — benchmarked against Faiss on recall, speed and memory.
+[![tests](https://github.com/DHaKK-SHeSH/vectorforge/actions/workflows/ci.yml/badge.svg)](https://github.com/DHaKK-SHeSH/vectorforge/actions/workflows/ci.yml)
 
-> 🚧 Almost v1.0: all five indexes are done, benchmarked on SIFT10K and SIFT1M, and can be saved, loaded and served over HTTP. Next: final polish.
+Approximate nearest-neighbour search written from scratch in NumPy: the index types inside vector databases like Faiss, Milvus and Qdrant, built one by one, tested, and benchmarked against Faiss on 10 thousand and 1 million vectors.
 
-**Headline (SIFT1M, 1 million vectors):** my IVF is 2× and my HNSW 3.3× faster than exact search at about 92% recall. Details in [SIFT1M: does it scale?](#sift1m-does-it-scale)
+**What's inside**
 
-## Results
+- **Five indexes:** exact search, IVF (k-means cells), product quantisation (PQ), IVF-PQ (cells + compressed codes) and HNSW (a layered neighbour graph)
+- **Two fixes for what the benchmarks found (v1.1):** exact re-ranking for compressed indexes, and HNSW's neighbour-selection heuristic
+- **Benchmarks** against Faiss on SIFT10K and SIFT1M: recall, speed, memory and build time
+- **Save / load** for every index (one file, no pickle) and a **FastAPI search service** with a Dockerfile
+- 100+ tests, run on GitHub Actions on every push
+
+## Which index when
+
+Every index trades between recall, speed, memory and build time. From my measurements:
+
+| You need | Use | Why (numbers from this repo) |
+|---|---|---|
+| near-perfect answers, or a small collection | **exact search** | always 100%; on 10k vectors it was also the fastest at high recall |
+| fast queries at 90-99% recall, memory not tight | **HNSW** (M = 16) | 3.3x faster than exact search at 92% on 1M vectors; but 777 MB and a 58-minute build in Python |
+| a quick build and decent speed | **IVF** | built in 1.6 min on 1M vectors (vs 58 for HNSW), 2x faster than exact at 92% |
+| very little memory | **IVF-PQ + re-ranking** | 8 bytes per vector in RAM (64x smaller), full vectors on disk; re-ranking lifts recall from 0.61 to 0.95 on SIFT10K |
+| the smallest possible index, accuracy secondary | **PQ** | 8 bytes per vector, but only 31% recall on 1M without re-ranking |
+
+**Headlines**
+
+- **SIFT1M (1 million vectors):** my IVF is 2x and my HNSW 3.3x faster than exact search at about 92% recall. [Details](#sift1m-does-it-scale)
+- **Re-ranking (v1.1):** IVF-PQ's recall goes from 0.61 to 0.95 at the same speed, with only 0.34 MB in RAM. [Details](#v11-fixing-what-the-benchmarks-found)
+- **HNSW heuristic (v1.1):** at M = 8, recall at ef_search = 10 goes from 0.75 to 0.90 (Faiss: 0.88), with 27% fewer links. [Details](#v11-fixing-what-the-benchmarks-found)
+- **Faiss is about 4-120x faster** with the same algorithms (compiled loops vs my Python loops), while my recall matches it.
+
+## Results on SIFT10K
 
 SIFT10K (10,000 base vectors, 100 queries, 128 dimensions), k = 10, measured on my laptop. Faiss runs single-threaded for a fair comparison. Speeds come from separate runs, and laptop timings vary by up to about 1.5× between runs (Flat measured 4,568 and 7,657 QPS), so compare speeds within one sweep.
 
@@ -21,7 +46,7 @@ SIFT10K (10,000 base vectors, 100 queries, 128 dimensions), k = 10, measured on 
 | PQ (Faiss) | m=8, 8 bits | 0.586 | 14,243 | 0.08 + 0.13 codebooks |
 | IVF-PQ (VectorForge) | nlist=100, nprobe=8, m=8 (8-byte codes) | 0.607 | 700 | ≈0.34 (codes 0.08, ids 0.08, codebooks + centroids 0.18) |
 | IVF-PQ (Faiss) | nlist=100, nprobe=8, m=8 | 0.588 | 44,098 | — |
-| HNSW (VectorForge) | M=16, ef_construction=100, ef_search=64 | 0.992 | 859 | ≈7.8 (vectors 5.12 + ≈33 links/vector at 8 bytes) |
+| HNSW (VectorForge, v1.0) | M=16, ef_construction=100, ef_search=64 | 0.992 | 859 | ≈7.8 (vectors 5.12 + ≈33 links/vector at 8 bytes) |
 | HNSW (Faiss) | M=16, efConstruction=100, efSearch=64 | 0.996 | 22,078 | — |
 
 ## IVF: speed vs recall
@@ -88,6 +113,8 @@ Reference points in the same run: plain PQ (m = 8, no cells) 0.558 at 2,902 QPS;
 
 ## HNSW: graph search
 
+*These are the v1.0 results, where each new vector simply linked to its M closest candidates. v1.1 adds the neighbour-selection heuristic: see [below](#v11-fixing-what-the-benchmarks-found).*
+
 HNSW links every vector to its nearest neighbours and stacks sparser copies of that graph on top, like zoom levels on a map. A search starts at the top layer, walks greedily towards the query, drops a layer, and finishes with a best-first search on layer 0 that keeps a shortlist of `ef_search` candidates. Vectors are stored in full, so distances are exact; the only approximation is which vectors the walk reaches.
 
 ![Recall vs queries per second for VectorForge HNSW and Faiss HNSW at M = 8 and 16](docs/hnsw_sweep.png)
@@ -139,9 +166,61 @@ Settings: nlist = 1024, m = 8 (8 bytes per vector), HNSW M = 16 with ef_construc
     - fast queries at about 90%: **HNSW**, 1.6× faster than IVF at the same recall, but it needs 50% more memory than IVF and took 58 minutes to build instead of 1.6
 - \* **A note on fairness:** my exact search (80 queries/s) beat Faiss's (23) only because NumPy's matrix multiply automatically used every CPU core, while I limited Faiss to one. Everywhere else my code runs mostly on one core in Python loops, and Faiss is 6–18× faster at searching.
 
+## v1.1: fixing what the benchmarks found
+
+The benchmarks above left two clear weaknesses, both written down in the findings. v1.1 fixes both.
+
+### A. Exact re-ranking for compressed indexes
+
+**The problem:** IVF-PQ's recall stops at 0.61 on SIFT10K and 0.37 on SIFT1M, because 8-byte codes can't tell close neighbours apart.
+
+**The fix** (`vectorforge/refine.py`, what Faiss calls `IndexRefineFlat`): ask IVF-PQ for a **shortlist** of k x k_factor candidates (e.g. 100), then measure the **exact** distance to each with the original vectors and keep the best k. IVF-PQ only has to get the true neighbours somewhere into the shortlist, not in the right order. Only those 100 full vectors are read per query, so they can stay **on disk** (a memory-mapped file) while only the codes sit in RAM.
+
+![Recall vs k_factor and speed vs recall for IVF-PQ with exact re-ranking, VectorForge and Faiss](docs/refine_sweep.png)
+
+IVF-PQ, nlist = 100, m = 8, SIFT10K, k = 10. RAM: 0.34 MB; full vectors on disk: 5.12 MB.
+
+| k_factor (shortlist) | nprobe 8: recall@10 | QPS | nprobe 16: recall@10 | QPS | Faiss, nprobe 16: recall@10 |
+|---|---|---|---|---|---|
+| 1 (10, IVF-PQ alone) | 0.607 | 839 | 0.607 | 435 | 0.590 |
+| 2 (20) | 0.779 | 840 | 0.790 | 435 | 0.800 |
+| 5 (50) | 0.925 | 840 | 0.945 | 424 | 0.943 |
+| 10 (100) | 0.952 | 832 | 0.980 | 426 | 0.975 |
+| 20 (200) | 0.961 | 817 | 0.990 | 390 | 0.985 |
+
+Full numbers: [`docs/refine_sweep.csv`](docs/refine_sweep.csv). This sweep ran on a different machine than the tables above (a cloud container), so compare speeds only within this table.
+
+- **Recall jumps from 0.61 to 0.95 at the same speed.** Measuring 100 exact distances per query costs almost nothing next to IVF-PQ's own search, so QPS barely moves.
+- **The new ceiling is IVF's, not PQ's.** With nprobe = 8, recall stops at 0.961, exactly IVF's recall at nprobe = 8 (0.961, table above): re-ranking fixes the order, but it can't find neighbours in cells that were never visited. Probing 16 cells raises the ceiling to 0.99.
+- **The memory trade-off is the point:** only 0.34 MB has to be in RAM. On a billion vectors that's the difference between 8 GB of codes in RAM with 512 GB on SSD, and 512 GB of RAM.
+
+### B. HNSW's neighbour-selection heuristic
+
+**The problem:** at M = 8, my HNSW reached only 0.75 recall at ef_search = 10, where Faiss reached 0.88 with the same settings.
+
+**The fix** (`HNSWIndex(heuristic=True)`, now the default): when choosing a new vector's links, go through the candidates closest first and keep one only if it is **closer to the new vector than to every link already kept**. My v1.0 code simply took the M closest, which can all sit on one side; the heuristic (from the HNSW paper, also used by Faiss) spreads the links in different directions, so searches coming from any side can reach the vector. The same rule is used when a node has too many links and has to drop some.
+
+![Recall vs speed for HNSW with closest-M links (v1.0), with the heuristic (v1.1) and Faiss, at M = 8 and 16](docs/hnsw_heuristic_sweep.png)
+
+SIFT10K, ef_construction = 100, k = 10:
+
+| ef_search | M=8, v1.0 | M=8, heuristic | Faiss M=8 | M=16, v1.0 | M=16, heuristic | Faiss M=16 |
+|---|---|---|---|---|---|---|
+| 10 | 0.746 | **0.896** | 0.882 | 0.922 | 0.916 | 0.907 |
+| 32 | 0.861 | **0.983** | 0.976 | 0.980 | **0.992** | 0.986 |
+| 64 | 0.903 | **0.995** | 0.996 | 0.992 | **0.997** | 0.996 |
+| 128 | 0.923 | **1.000** | 0.999 | 0.995 | **1.000** | 1.000 |
+| links per vector | 17.1 | **12.4** | | 33.1 | **15.7** | |
+
+Full numbers: [`docs/hnsw_heuristic_sweep.csv`](docs/hnsw_heuristic_sweep.csv) (same cloud machine as A).
+
+- **The M = 8 gap with Faiss is closed:** 0.896 vs Faiss's 0.882 at ef_search = 10, and 1.000 at 128 instead of getting stuck at 0.93.
+- **Fewer links, better graph.** The heuristic keeps fewer links (12 instead of 17 per vector at M = 8, half as many at M = 16), because links that only duplicate a direction are skipped. That's less memory, and recall still goes up: where the links point matters more than how many there are.
+- **The cost is build time** at M = 8 (23 s vs 17 s): every candidate is compared with the links already kept. At M = 16 the build is even a little faster, because nodes keep fewer links and have less to prune.
+
 ## Save, load and serve
 
-Building an index takes a while (20 seconds for HNSW on SIFT10K, an hour on SIFT1M), so you only want to do it once. `vectorforge.persist` writes any of the five indexes to a single `.npz` file and reads it back, and a small FastAPI app serves searches from it over HTTP.
+Building an index takes a while (20 seconds for HNSW on SIFT10K, an hour on SIFT1M), so you only want to do it once. `vectorforge.persist` writes any of the five indexes (and a re-ranking wrapper) to a single `.npz` file and reads it back, and a small FastAPI app serves searches from it over HTTP.
 
 ```python
 from vectorforge.persist import save, load
@@ -165,11 +244,11 @@ VF_INDEX=index.vf.npz uvicorn vectorforge.service:app --port 8000
 
 | Endpoint | What it does |
 |---|---|
-| `GET /health` | what's loaded: index type, number of vectors, dimension, current settings |
+| `GET /health` | what's loaded (index type, number of vectors, dimension, settings) and how many searches and queries it has served |
 | `POST /search` | `{"vectors": [[...128 numbers...]], "k": 10, "ef_search": 64}` → `{"ids": [[...]], "distances": [[...]], "took_ms": 5.3}` |
 | `GET /docs` | an interactive page to try the API in the browser (made by FastAPI) |
 
-`nprobe` (IVF, IVF-PQ) and `ef_search` (HNSW) can be set per request without changing the index's defaults. Wrong dimensions or a setting that doesn't fit the index type return a clear 422 error. The service is read-only: it loads the index once at start-up and only searches. There's also a `Dockerfile` that runs the same service in a container, with the index file mounted from outside.
+`nprobe` (IVF, IVF-PQ), `ef_search` (HNSW) and `k_factor` (re-ranking) can be set per request without changing the index's defaults. To serve IVF-PQ with re-ranking: `python scripts/build_index.py --kind ivfpq --refine 10 --out index.vf.npz`. Wrong dimensions or a setting that doesn't fit the index type return a clear 422 error. The service is read-only: it loads the index once at start-up and only searches. There's also a `Dockerfile` that runs the same service in a container, with the index file mounted from outside.
 
 ## Run it
 
@@ -182,6 +261,8 @@ python scripts/sweep_ivf.py     # IVF nprobe sweep vs Faiss → docs/ivf_sweep.c
 python scripts/sweep_pq.py      # PQ sweep over m vs Faiss → docs/pq_sweep.csv and .png
 python scripts/sweep_ivfpq.py   # IVF-PQ nprobe sweep, with/without residuals, vs Faiss → docs/ivfpq_sweep.csv and .png
 python scripts/sweep_hnsw.py    # HNSW ef_search sweep at M = 8 and 16 vs Faiss → docs/hnsw_sweep.csv and .png
+python scripts/sweep_refine.py  # v1.1: IVF-PQ + exact re-ranking over k_factor → docs/refine_sweep.csv and .png
+python scripts/sweep_hnsw_heuristic.py   # v1.1: HNSW closest-M vs heuristic → docs/hnsw_heuristic_sweep.csv and .png
 # SIFT1M: run notebooks/sift1m_benchmark.ipynb on Kaggle (CPU, internet on, about 1.5 hours)
 python scripts/build_index.py --kind hnsw --out index.vf.npz   # build + save an index
 uvicorn vectorforge.service:app                                # serve it (set VF_INDEX first, see above)
@@ -196,7 +277,8 @@ uvicorn vectorforge.service:app                                # serve it (set V
 - `vectorforge/ivf.py` — IVF index: k-means cells, inverted lists, nprobe search
 - `vectorforge/pq.py` — product quantisation: per-piece codebooks, 1-byte codes, lookup-table (ADC) search
 - `vectorforge/ivfpq.py` — IVF-PQ: IVF cells holding PQ codes of residuals, per-cell table lookups
-- `vectorforge/hnsw.py` — HNSW: layered neighbour graph, best-first search with two heaps, insert with pruning
+- `vectorforge/hnsw.py` — HNSW: layered neighbour graph, best-first search with two heaps, insert with pruning, neighbour-selection heuristic
+- `vectorforge/refine.py` — exact re-ranking of any index's shortlist (full vectors can stay on disk)
 - `vectorforge/persist.py` — save / load any index to one `.npz` file (no pickle)
 - `vectorforge/service.py` — FastAPI search service (`/health`, `/search`)
 - `vectorforge/bench.py` — one harness that measures every index the same way
@@ -204,6 +286,8 @@ uvicorn vectorforge.service:app                                # serve it (set V
 - `scripts/sweep_pq.py` — PQ recall/memory/speed sweep against Faiss
 - `scripts/sweep_ivfpq.py` — IVF-PQ nprobe sweep with and without residuals against Faiss
 - `scripts/sweep_hnsw.py` — HNSW ef_search sweep at two graph sizes against Faiss
+- `scripts/sweep_refine.py`, `scripts/sweep_hnsw_heuristic.py` — the v1.1 benchmarks
 - `notebooks/sift1m_benchmark.ipynb` — every index vs Faiss on 1 million vectors (Kaggle)
 - `scripts/build_index.py` — build one index on SIFT10K, save it, check the reload
 - `Dockerfile` — the search service in a container
+- `docs/tradeoffs.md` — the one decision that mattered most, and the measurements behind it

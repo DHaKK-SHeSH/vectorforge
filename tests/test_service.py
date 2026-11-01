@@ -90,3 +90,37 @@ def test_no_index_loaded_is_a_clear_error():
     service.STATE.update(index=None, info=None)
     r = TestClient(service.app).get("/health")
     assert r.status_code == 503
+
+
+def test_health_counts_searches_and_queries(client, data):
+    c, _ = client
+    _, xq = data
+    assert c.get("/health").json()["searches_served"] == 0
+    c.post("/search", json={"vectors": xq.tolist(), "k": 3})          # 1 request, 4 queries
+    c.post("/search", json={"vectors": xq[:1].tolist(), "k": 3})      # 1 request, 1 query
+    c.post("/search", json={"vectors": [[1.0]], "k": 3})              # refused (wrong size): not counted
+    body = c.get("/health").json()
+    assert body["searches_served"] == 2 and body["queries_served"] == 5
+
+
+def test_refine_index_knobs_reach_the_base(data, tmp_path):
+    from vectorforge.ivfpq import IVFPQIndex
+    from vectorforge.refine import RefineIndex
+    xb, xq = data
+    index = RefineIndex(IVFPQIndex(nlist=8, nprobe=2, m=4, nbits=4), k_factor=5)
+    index.train(xb)
+    index.add(xb)
+    save(index, tmp_path / "r.npz")
+    service.load_index(str(tmp_path / "r.npz"))
+    try:
+        c = TestClient(service.app)
+        assert c.get("/health").json()["kind"] == "RefineIndex(IVFPQIndex)"
+        r = c.post("/search", json={"vectors": xq.tolist(), "k": 5, "nprobe": 8, "k_factor": 20})
+        assert r.status_code == 200
+        loaded = service.STATE["index"]
+        assert loaded.base.nprobe == 2 and loaded.k_factor == 5                # defaults restored
+        exact = ((xb[None, :, :] - xq[:, None, :]) ** 2).sum(-1).argsort(axis=1)[:, :5]
+        assert r.json()["ids"] == exact.tolist()                               # all cells + big shortlist = exact
+        assert c.post("/search", json={"vectors": xq.tolist(), "k": 5, "ef_search": 9}).status_code == 422
+    finally:
+        service.STATE.update(index=None, info=None)

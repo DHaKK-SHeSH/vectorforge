@@ -5,7 +5,8 @@
     VF_INDEX=index.vf.npz uvicorn vectorforge.service:app --port 8000
 
 Then:
-    GET  /health   -> what is loaded: {"kind": "HNSWIndex", "n_vectors": 10000, "dim": 128, ...}
+    GET  /health   -> what is loaded + how much it was used:
+                      {"kind": "HNSWIndex", "n_vectors": 10000, "dim": 128, "searches_served": 12, ...}
     POST /search   -> {"vectors": [[...128 numbers...], ...], "k": 10, "ef_search": 64}
                       returns {"ids": [[...]], "distances": [[...]], "took_ms": 1.9}
     GET  /docs     -> interactive API page (FastAPI makes it automatically)
@@ -26,8 +27,9 @@ from pydantic import BaseModel, Field
 
 from .persist import describe, load
 
-STATE = {"index": None, "info": None}
-LOCK = threading.Lock()          # one search at a time: nprobe / ef_search are set on the shared index
+STATE = {"index": None, "info": None, "searches": 0, "queries": 0}
+LOCK = threading.Lock()          # one search at a time: the knobs are set on the shared index
+KNOBS = ("nprobe", "ef_search", "k_factor")
 
 
 class SearchRequest(BaseModel):
@@ -36,6 +38,7 @@ class SearchRequest(BaseModel):
     k: int = Field(10, ge=1, le=1000, description="how many neighbours per query")
     nprobe: Optional[int] = Field(None, ge=1, description="IVF / IVF-PQ only: cells to visit")
     ef_search: Optional[int] = Field(None, ge=1, description="HNSW only: shortlist size")
+    k_factor: Optional[int] = Field(None, ge=1, le=100, description="RefineIndex only: re-rank k * k_factor candidates")
 
 
 class SearchResponse(BaseModel):
@@ -45,8 +48,18 @@ class SearchResponse(BaseModel):
 
 
 def load_index(path: str) -> None:
-    STATE["index"] = load(path)
+    STATE.update(index=load(path), searches=0, queries=0)
     STATE["info"] = describe(STATE["index"])
+
+
+def knob_owner(index, knob):
+    """The object a setting lives on: the index itself, or the base index inside a RefineIndex."""
+    if hasattr(index, knob):
+        return index
+    base = getattr(index, "base", None)
+    if base is not None and hasattr(base, knob):
+        return base
+    return None
 
 
 @asynccontextmanager
@@ -67,7 +80,8 @@ app = FastAPI(title="VectorForge", description="Nearest-neighbour search from sc
 def health():
     if STATE["index"] is None:
         raise HTTPException(503, "no index loaded: set VF_INDEX to a file written by vectorforge.persist.save")
-    return {"status": "ok", **STATE["info"]}
+    return {"status": "ok", **STATE["info"],
+            "searches_served": STATE["searches"], "queries_served": STATE["queries"]}
 
 
 @app.post("/search", response_model=SearchResponse)
@@ -79,22 +93,25 @@ def search(req: SearchRequest):
     xq = np.asarray(req.vectors, dtype=np.float32)
     if xq.ndim != 2 or xq.shape[1] != info["dim"]:
         raise HTTPException(422, f"every query needs exactly {info['dim']} numbers")
-    for knob in ("nprobe", "ef_search"):
-        if getattr(req, knob) is not None and not hasattr(index, knob):
+    for knob in KNOBS:
+        if getattr(req, knob) is not None and knob_owner(index, knob) is None:
             raise HTTPException(422, f"{knob} does not apply to a {info['kind']}")
 
     with LOCK:
-        old = {knob: getattr(index, knob) for knob in ("nprobe", "ef_search") if hasattr(index, knob)}
+        owners = {knob: knob_owner(index, knob) for knob in KNOBS if knob_owner(index, knob) is not None}
+        old = {knob: getattr(owner, knob) for knob, owner in owners.items()}
         try:
-            for knob in old:
+            for knob, owner in owners.items():
                 if getattr(req, knob) is not None:
-                    setattr(index, knob, getattr(req, knob))
+                    setattr(owner, knob, getattr(req, knob))
             t0 = time.perf_counter()
             D, I = index.search(xq, req.k)
             took = (time.perf_counter() - t0) * 1000
+            STATE["searches"] += 1                          # one request ...
+            STATE["queries"] += len(xq)                     # ... can hold many query vectors
         finally:
-            for knob, value in old.items():               # requests never change the defaults
-                setattr(index, knob, value)
+            for knob, owner in owners.items():              # requests never change the defaults
+                setattr(owner, knob, old[knob])
 
     D = np.where(np.isfinite(D), D, -1.0)                 # JSON has no infinity: padded slots get -1
     return SearchResponse(ids=I.tolist(), distances=D.tolist(), took_ms=round(took, 3))

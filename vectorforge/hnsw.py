@@ -21,6 +21,11 @@ What the index stores (full vectors, like Flat and IVF: distances are exact):
 
 Settings:
   M                links per node (M0 = 2 * M on layer 0)
+  heuristic        how links are chosen (v1.1). False: simply the M closest candidates.
+                   True (default, as in the HNSW paper and Faiss): go through the candidates
+                   closest first and keep one only if it is closer to the new vector than to
+                   every neighbour already kept. That spreads the links in different
+                   directions instead of bunching them on one side.
   ef_construction  how many candidates to keep while inserting (bigger = better graph, slower build)
   ef_search        how many candidates to keep while searching (bigger = higher recall, slower search)
 
@@ -34,12 +39,14 @@ import numpy as np
 
 
 class HNSWIndex:
-    def __init__(self, M: int = 16, ef_construction: int = 100, ef_search: int = 50, seed: int = 0):
+    def __init__(self, M: int = 16, ef_construction: int = 100, ef_search: int = 50, seed: int = 0,
+                 heuristic: bool = True):
         self.M = M                       # max links per node on layers 1, 2, ...
         self.M0 = 2 * M                  # max links per node on layer 0
         self.mL = 1 / math.log(M)        # level multiplier: about 1 in M nodes go up a layer
         self.ef_construction = ef_construction
         self.ef_search = ef_search
+        self.heuristic = heuristic       # v1.1: diverse neighbours instead of just the closest
         self.rng = np.random.default_rng(seed)
         self.xb = None                   # (n, d) float32
         self.levels = []                 # levels[i] = top layer of vector i
@@ -52,14 +59,42 @@ class HNSWIndex:
         """Squared distances from one vector q (d,) to the vectors with these ids. (Given.)"""
         return ((self.xb[ids] - q) ** 2).sum(axis=1)
 
+    def _select_neighbours(self, candidates: list, limit: int) -> list:
+        """Choose at most `limit` neighbours from candidates = [(distance to the node, id), ...],
+        sorted closest first. Returns their ids. (v1.1)
+
+        heuristic = False: the `limit` closest.
+        heuristic = True:  walk through the candidates closest first and keep candidate c only if
+                           c is closer to the node than to every neighbour already kept.
+                           Example: node at 0; candidates 1.0 and 1.1 (east) and -2.0 (west).
+                           1.0 is kept. 1.1 is closer to 1.0 (0.01) than to the node (1.21): skipped.
+                           -2.0 is closer to the node (4) than to 1.0 (9): kept -> one link each way.
+        """
+        if not self.heuristic:
+            return [n for _, n in candidates[:limit]]
+        ids = [n for _, n in candidates]
+        d_node = np.array([d for d, _ in candidates], dtype=np.float32)
+        x = self.xb[ids]
+        norms = (x ** 2).sum(axis=1)
+        pair = norms[:, None] - 2 * (x @ x.T) + norms           # distances between the candidates
+        kept = []                                                 # positions in `candidates`
+        for j in range(len(ids)):
+            if len(kept) >= limit:
+                break
+            if kept and (pair[j, kept] < d_node[j]).any():       # closer to a kept neighbour: skip
+                continue
+            kept.append(j)
+        return [ids[j] for j in kept]
+
     def _shrink(self, node: int, level: int) -> None:
-        """If node has too many links on this layer, keep only its closest ones. (Given.)"""
+        """If node has too many links on this layer, keep only the best ones (closest, or
+        diverse with the heuristic). (Given.)"""
         limit = self.M0 if level == 0 else self.M
         nbrs = self.graph[level][node]
         if len(nbrs) > limit:
             d = self._distances(self.xb[node], nbrs)
-            keep = np.argsort(d)[:limit]
-            self.graph[level][node] = [nbrs[j] for j in keep]
+            order = np.argsort(d)
+            self.graph[level][node] = self._select_neighbours([(float(d[j]), nbrs[j]) for j in order], limit)
 
     def add(self, xb: np.ndarray) -> None:
         """Store the vectors and insert them into the graph one by one. (Given.)"""
@@ -115,7 +150,7 @@ class HNSWIndex:
         heapq.heapify(results)
         
         while len(results)>ef:
-            heapq.headppop(results)
+            heapq.heappop(results)
             
         while candidates:
             dist_c, c = heapq.heappop(candidates)
@@ -182,7 +217,7 @@ class HNSWIndex:
         for l in range(min(level,self.max_level), -1, -1):
             found = self._search_layer(q,ep,self.ef_construction,l)
             limit = self.M0 if l == 0 else self.M
-            neighbours = [n for _, n  in found[:limit]]
+            neighbours = self._select_neighbours(found, limit)     # v1.1: was the `limit` closest
             self.graph[l][i] = neighbours
             for n in neighbours:
                 self.graph[l][n].append(i)

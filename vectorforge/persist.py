@@ -4,7 +4,8 @@
     save(index, "index.vf.npz")
     index = load("index.vf.npz")      # same results as before, instantly
 
-Works for FlatIndex, IVFIndex, PQIndex, IVFPQIndex and HNSWIndex.
+Works for FlatIndex, IVFIndex, PQIndex, IVFPQIndex, HNSWIndex and RefineIndex
+(a RefineIndex is stored as its base index + the full vectors).
 
 Format: ONE .npz file (NumPy's zip of arrays). The settings go in a small JSON
 string stored inside it; everything else is plain arrays. Lists of arrays with
@@ -26,6 +27,7 @@ from .hnsw import HNSWIndex
 from .ivf import IVFIndex
 from .ivfpq import IVFPQIndex
 from .pq import PQIndex
+from .refine import RefineIndex
 
 FORMAT_VERSION = 1
 
@@ -51,6 +53,12 @@ def _unpack(values, offsets):
 # ---------------------------------------------------------------- save
 def save(index, path) -> None:
     """Write a built index to `path` (a .npz file)."""
+    meta, arrays = _to_parts(index)
+    np.savez(Path(path), meta=np.array(json.dumps(meta)), **arrays)
+
+
+def _to_parts(index):
+    """index -> (meta dict, {name: array})."""
     kind = type(index).__name__
     meta = {"format": FORMAT_VERSION, "kind": kind}
     arrays = {}
@@ -81,6 +89,7 @@ def save(index, path) -> None:
 
     elif kind == "HNSWIndex":
         meta.update(M=index.M, ef_construction=index.ef_construction, ef_search=index.ef_search,
+                    heuristic=index.heuristic,
                     entry_point=index.entry_point, max_level=index.max_level,
                     rng_state=index.rng.bit_generator.state)       # so later inserts continue identically
         arrays["xb"] = index.xb
@@ -91,13 +100,19 @@ def save(index, path) -> None:
             arrays[f"layer{l}_links"], arrays[f"layer{l}_offsets"] = _pack([layer[i] for i in nodes], np.int64)
         meta["n_layers"] = len(index.graph)
 
+    elif kind == "RefineIndex":
+        base_meta, base_arrays = _to_parts(index.base)
+        meta.update(k_factor=index.k_factor, base=base_meta)
+        arrays["xb"] = None if index.xb is None else np.asarray(index.xb)
+        arrays.update({"base__" + name: value for name, value in base_arrays.items()})
+
     else:
         raise TypeError(f"don't know how to save a {kind}")
 
     for name, value in arrays.items():
         if value is None:
             raise ValueError(f"{kind}.{name} is empty: train and add before saving")
-    np.savez(Path(path), meta=np.array(json.dumps(meta)), **arrays)
+    return meta, arrays
 
 
 # ---------------------------------------------------------------- load
@@ -108,6 +123,11 @@ def load(path):
         a = {k: f[k] for k in f.files if k != "meta"}
     if meta.get("format") != FORMAT_VERSION:
         raise ValueError(f"unsupported file format {meta.get('format')}")
+    return _from_parts(meta, a)
+
+
+def _from_parts(meta, a):
+    """(meta dict, {name: array}) -> a ready index."""
     kind = meta["kind"]
 
     if kind == "FlatIndex":
@@ -136,7 +156,8 @@ def load(path):
         index.list_codes = _unpack(a["list_codes"], a["list_offsets"])
 
     elif kind == "HNSWIndex":
-        index = HNSWIndex(M=meta["M"], ef_construction=meta["ef_construction"], ef_search=meta["ef_search"])
+        index = HNSWIndex(M=meta["M"], ef_construction=meta["ef_construction"], ef_search=meta["ef_search"],
+                          heuristic=meta.get("heuristic", False))     # files from before v1.1 used plain selection
         index.rng.bit_generator.state = meta["rng_state"]
         index.xb = a["xb"]
         index.levels = [int(v) for v in a["levels"]]
@@ -148,6 +169,11 @@ def load(path):
         index.entry_point = meta["entry_point"]
         index.max_level = meta["max_level"]
 
+    elif kind == "RefineIndex":
+        base = _from_parts(meta["base"], {k[len("base__"):]: v for k, v in a.items() if k.startswith("base__")})
+        index = RefineIndex(base, k_factor=meta["k_factor"])
+        index.xb = a["xb"]
+
     else:
         raise ValueError(f"unknown index kind {kind!r}")
     return index
@@ -156,6 +182,10 @@ def load(path):
 def describe(index) -> dict:
     """A small summary for logs and the /health endpoint."""
     kind = type(index).__name__
+    if kind == "RefineIndex":
+        info = describe(index.base)
+        info.update(kind=f"RefineIndex({info['kind']})", k_factor=index.k_factor)
+        return info
     if kind == "PQIndex":
         n, d = len(index.codes), index.m * index.dsub
     elif kind == "IVFPQIndex":

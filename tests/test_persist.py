@@ -88,3 +88,19 @@ def test_files_load_without_pickle(data, tmp_path):
     save(build("hnsw", xt, xb), tmp_path / "h.npz")
     with np.load(tmp_path / "h.npz", allow_pickle=False) as f:      # would raise if anything needed pickle
         assert "meta" in f.files
+
+
+def test_refine_index_round_trip(data, tmp_path):
+    """A RefineIndex is saved as its base index + the full vectors, and gives the same answers back."""
+    from vectorforge.refine import RefineIndex
+    xt, xb, xq = data
+    index = RefineIndex(IVFPQIndex(nlist=12, nprobe=3, m=4, nbits=4), k_factor=7)
+    index.train(xt)
+    index.add(xb)
+    save(index, tmp_path / "r.npz")
+    loaded = load(tmp_path / "r.npz")
+    assert type(loaded) is RefineIndex and type(loaded.base) is IVFPQIndex
+    assert loaded.k_factor == 7 and loaded.base.nprobe == 3
+    np.testing.assert_array_equal(index.search(xq, 10)[1], loaded.search(xq, 10)[1])
+    info = describe(loaded)
+    assert info["kind"] == "RefineIndex(IVFPQIndex)" and info["k_factor"] == 7 and info["n_vectors"] == len(xb)
